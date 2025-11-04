@@ -666,14 +666,30 @@ def responses_output_items_from_assistant_message(
     output: list[ResponseOutputItem] = []
     for content in message.content:
         if isinstance(content, ContentText):
-            # check for content.internal
-            if content.internal:
+            # Strip any existing content-internal tags from the text first
+            # (in case they were added in a previous round trip)
+            text_without_tags, _ = parse_content_with_internal(
+                content.text, CONTENT_INTERNAL_TAG
+            )
+            
+            # Check if content looks like JSON (starts with { or [)
+            # If so, don't append content-internal tag as it will break JSON parsing
+            text_stripped = text_without_tags.strip()
+            is_json_like = (
+                text_stripped.startswith("{") or text_stripped.startswith("[")
+            ) and (
+                text_stripped.endswith("}") or text_stripped.endswith("]")
+            )
+            
+            # check for content.internal - but don't append if content is JSON
+            # This preserves metadata without breaking JSON parsing
+            if content.internal and not is_json_like:
                 internal: str = f"\n{content_internal_tag(content.internal)}\n"
             else:
                 internal = ""
 
-            # apply internal to content
-            content_text = f"{content.text}{internal}"
+            # apply internal to content (using cleaned text)
+            content_text = f"{text_without_tags}{internal}"
 
             output.append(
                 ResponseOutputMessage(

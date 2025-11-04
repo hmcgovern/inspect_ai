@@ -116,6 +116,7 @@ from inspect_ai.model._chat_message import (
     ChatMessageAssistant,
     ChatMessageTool,
 )
+from inspect_ai.model._internal import CONTENT_INTERNAL_TAG, parse_content_with_internal
 from inspect_ai.model._generate_config import GenerateConfig
 from inspect_ai.model._model_output import ChatCompletionChoice, ModelUsage, StopReason
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
@@ -506,7 +507,7 @@ def _chat_message_assistant_from_openai_response(
                 message_content.extend(
                     [
                         ContentText(
-                            text=c.text,
+                            text=parse_content_with_internal(c.text, CONTENT_INTERNAL_TAG)[0],
                             internal={MESSAGE_ID: id},
                             citations=(
                                 [
@@ -519,7 +520,9 @@ def _chat_message_assistant_from_openai_response(
                         )
                         if isinstance(c, ResponseOutputText)
                         else ContentText(
-                            text=c.refusal, refusal=True, internal={MESSAGE_ID: id}
+                            text=parse_content_with_internal(c.refusal, CONTENT_INTERNAL_TAG)[0],
+                            refusal=True,
+                            internal={MESSAGE_ID: id},
                         )
                         for c in content
                     ]
