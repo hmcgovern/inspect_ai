@@ -5,6 +5,7 @@ from typing import Any, Iterable, Set, cast
 
 from openai.types.responses import (
     Response,
+    ResponseCodeInterpreterToolCall,
     ResponseComputerToolCall,
     ResponseCustomToolCall,
     ResponseFunctionCallOutputItemListParam,
@@ -20,31 +21,19 @@ from openai.types.responses import (
     ResponseOutputRefusal,
     ResponseOutputText,
     ResponseReasoningItem,
-    ToolParam,
-    WebSearchToolParam,
 )
-from openai.types.responses import (
-    Tool as ResponsesTool,
-)
-from openai.types.responses.response import (
-    IncompleteDetails,
-)
-from openai.types.responses.response import (
-    ToolChoice as ResponsesToolChoice,
-)
+from openai.types.responses import Tool as ResponsesTool
+from openai.types.responses import ToolParam, WebSearchToolParam
+from openai.types.responses.response import IncompleteDetails
+from openai.types.responses.response import ToolChoice as ResponsesToolChoice
 from openai.types.responses.response_create_params import (
     ToolChoice as ResponsesToolChoiceParam,
 )
 from openai.types.responses.response_custom_tool_call_output_param import (
     OutputOutputContentList,
 )
-from openai.types.responses.response_function_web_search import (
-    Action,
-    ActionSearch,
-)
-from openai.types.responses.response_input_item_param import (
-    Message,
-)
+from openai.types.responses.response_function_web_search import Action, ActionSearch
+from openai.types.responses.response_input_item_param import Message
 from openai.types.responses.response_output_item import (
     McpCall,
     McpListTools,
@@ -71,10 +60,7 @@ from inspect_ai.model._chat_message import (
     ChatMessageTool,
     ChatMessageUser,
 )
-from inspect_ai.model._generate_config import (
-    GenerateConfig,
-    ResponseSchema,
-)
+from inspect_ai.model._generate_config import GenerateConfig, ResponseSchema
 from inspect_ai.model._internal import (
     CONTENT_INTERNAL_TAG,
     content_internal_tag,
@@ -85,6 +71,7 @@ from inspect_ai.model._model_output import StopReason
 from inspect_ai.model._openai_responses import (
     content_from_response_input_content_param,
     is_assistant_message_param,
+    is_code_interpreter_tool_param,
     is_computer_call_output,
     is_computer_tool_param,
     is_custom_tool_call_output,
@@ -92,6 +79,7 @@ from inspect_ai.model._openai_responses import (
     is_function_call_output,
     is_function_tool_param,
     is_mcp_tool_param,
+    is_response_code_interpreter_tool_call,
     is_response_computer_tool_call,
     is_response_custom_tool_call,
     is_response_function_tool_call,
@@ -130,6 +118,7 @@ from inspect_ai.tool._tool_info import ToolInfo
 from inspect_ai.tool._tool_params import ToolParams
 from inspect_ai.tool._tool_util import tool_to_tool_info
 from inspect_ai.tool._tools._computer._computer import computer
+from inspect_ai.tool._tools._execute import python
 from inspect_ai.tool._tools._web_search._web_search import (
     WebSearchProviders,
     web_search,
@@ -294,6 +283,8 @@ def tool_from_responses_tool(
         )
     elif is_computer_tool_param(tool_param):
         return computer()
+    elif is_code_interpreter_tool_param(tool_param):
+        return python()
     elif is_mcp_tool_param(tool_param):
         allowed_tools = tool_param["allowed_tools"]
         if isinstance(allowed_tools, dict):
@@ -493,6 +484,24 @@ def messages_from_responses_input(
                     computer_call = ResponseComputerToolCall.model_validate(param)
                     tool_calls.append(
                         tool_call_from_openai_computer_tool_call(computer_call)
+                    )
+                elif is_response_code_interpreter_tool_call(param):
+                    code_interpreter_call = ResponseCodeInterpreterToolCall.model_validate(param)
+                    call_id = getattr(code_interpreter_call, "call_id", None) or getattr(code_interpreter_call, "id", None)
+                    code_input = (
+                        getattr(code_interpreter_call, "input", None)
+                        or getattr(code_interpreter_call, "code", None)
+                        or code_interpreter_call.model_dump().get("input", "")
+                    )
+                    if call_id is None:
+                        call_id = uuid()
+                    function_calls_by_id[call_id] = "python"
+                    tool_calls.append(
+                        ToolCall(
+                            id=call_id,
+                            function="python",
+                            arguments={"code": code_input if code_input else ""},
+                        )
                     )
 
                 elif is_response_reasoning_item(param):
@@ -741,6 +750,19 @@ def responses_output_items_from_assistant_message(
                     call_id=tool_call.id,
                     pending_safety_checks=[],
                     status="completed",
+                )
+            )
+        elif tool_call.function == "python":
+            # Map python() tool calls back to ResponseCodeInterpreterToolCall
+            code = tool_call.arguments.get("code", "")
+            output.append(
+                ResponseCodeInterpreterToolCall(
+                    id=uuid(),
+                    type="code_interpreter_call",
+                    call_id=tool_call.id,
+                    container_id=uuid(),  # Generate a container_id for the code interpreter
+                    status="completed",
+                    input=code,
                 )
             )
         elif tool_call.type == "custom":

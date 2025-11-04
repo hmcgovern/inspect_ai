@@ -9,6 +9,11 @@ from openai.types.responses import (
     CustomToolParam,
     EasyInputMessageParam,
     FunctionToolParam,
+)
+from openai.types.responses import Response as OpenAIResponse
+from openai.types.responses import (
+    ResponseCodeInterpreterToolCall,
+    ResponseCodeInterpreterToolCallParam,
     ResponseComputerToolCall,
     ResponseComputerToolCallParam,
     ResponseCustomToolCall,
@@ -39,7 +44,6 @@ from openai.types.responses import (
     ToolParam,
     WebSearchToolParam,
 )
-from openai.types.responses import Response as OpenAIResponse
 from openai.types.responses.response import IncompleteDetails
 from openai.types.responses.response_create_params import (
     ToolChoice as ResponsesToolChoiceParam,
@@ -57,7 +61,6 @@ from openai.types.responses.response_input_image_content_param import (
 from openai.types.responses.response_input_item_param import (
     ComputerCallOutput,
     FunctionCallOutput,
-    Message,
 )
 from openai.types.responses.response_input_item_param import McpCall as McpCallParam
 from openai.types.responses.response_input_item_param import (
@@ -66,13 +69,11 @@ from openai.types.responses.response_input_item_param import (
 from openai.types.responses.response_input_item_param import (
     McpListToolsTool as McpListToolsToolParam,
 )
+from openai.types.responses.response_input_item_param import Message
 from openai.types.responses.response_input_text_content_param import (
     ResponseInputTextContentParam,
 )
-from openai.types.responses.response_output_item import (
-    McpCall,
-    McpListTools,
-)
+from openai.types.responses.response_output_item import McpCall, McpListTools
 from openai.types.responses.response_output_message_param import (
     Content as OutputContent,
 )
@@ -94,8 +95,9 @@ from openai.types.responses.response_usage import (
     InputTokensDetails,
     OutputTokensDetails,
 )
-from openai.types.responses.tool_param import Mcp
+from openai.types.responses.tool_param import CodeInterpreter, Mcp
 from pydantic import JsonValue, TypeAdapter, ValidationError
+from shortuuid import uuid
 
 from inspect_ai._util.citation import Citation, DocumentCitation, UrlCitation
 from inspect_ai._util.content import (
@@ -592,6 +594,61 @@ def _chat_message_assistant_from_openai_response(
 
                 tool_calls.append(tool_call_from_openai_computer_tool_call(output))
 
+            case ResponseCodeInterpreterToolCall():
+                stop_reason = "tool_calls"
+                # ResponseCodeInterpreterToolCall uses 'id' instead of 'call_id'
+                call_id = getattr(output, "call_id", None) or getattr(output, "id", None)
+                
+                # Get the full dump to inspect structure and extract code
+                output_dump = output.model_dump()
+                if call_id is not None:
+                    assistant_internal().tool_calls[call_id] = cast(
+                        ResponseCodeInterpreterToolCallParam, output_dump
+                    )
+
+                # Map code interpreter tool call to python() function
+                # ResponseCodeInterpreterToolCall structure:
+                # - May have 'input' attribute for the code
+                # - Code might come in streaming chunks, so initial call might be empty
+                # - Try accessing via attribute first, then model_dump
+                code_input = (
+                    getattr(output, "input", None)
+                    or getattr(output, "code", None)
+                    or output_dump.get("input")
+                    or output_dump.get("code")
+                )
+                
+                # If code is still not found, check if there's code in a nested structure
+                # Some code interpreter calls might have code in code_chunks or similar
+                if not code_input:
+                    # Try accessing nested structures that might contain code
+                    for key in ["code_chunks", "chunks", "content"]:
+                        if key in output_dump:
+                            chunk_data = output_dump[key]
+                            if isinstance(chunk_data, list) and chunk_data:
+                                # Extract text from chunks
+                                code_parts = [
+                                    chunk.get("text", "") if isinstance(chunk, dict) else str(chunk)
+                                    for chunk in chunk_data
+                                ]
+                                code_input = "".join(code_parts)
+                                break
+                            elif isinstance(chunk_data, str):
+                                code_input = chunk_data
+                                break
+                
+                # Generate a call_id if not present (use id or generate uuid)
+                if call_id is None:
+                    call_id = uuid()
+                
+                tool_calls.append(
+                    ToolCall(
+                        id=call_id,
+                        function="python",
+                        arguments={"code": code_input if code_input else ""},
+                    )
+                )
+
             case ResponseFunctionWebSearch():
                 assistant_internal().server_tool_uses[output.id] = cast(
                     ResponseFunctionWebSearchParam, output.model_dump(exclude_none=True)
@@ -930,6 +987,7 @@ def _maybe_native_tool_param(
             maybe_computer_use_preview_tool(tool)
             or maybe_web_search_tool(model_name, tool)
             or maybe_mcp_tool(tool)
+            or maybe_code_interpreter_tool(tool)
             # or self.text_editor_tool_param(tool)
             # or self.bash_tool_param(tool)
         )
@@ -968,8 +1026,19 @@ _ResponseToolCallParam = (
     ResponseFunctionToolCallParam
     | ResponseComputerToolCallParam
     | ResponseFunctionWebSearchParam
+    | ResponseCodeInterpreterToolCallParam
     # | ResponseFileSearchToolCallParam
 )
+
+
+def maybe_code_interpreter_tool(tool: ToolInfo) -> CodeInterpreter | None:
+    # Check if this is the python tool - it should have a "code" parameter
+    # (may also have optional parameters like timeout, user, sandbox)
+    return (
+        CodeInterpreter(type="code_interpreter", container={"type": "auto"})
+        if tool.name == "python" and "code" in tool.parameters.properties
+        else None
+    )
 
 
 def maybe_mcp_tool(tool: ToolInfo) -> Mcp | None:
@@ -1135,6 +1204,7 @@ def is_assistant_message_param(
         or is_response_web_search_call(param)
         or is_response_function_tool_call(param)
         or is_response_custom_tool_call(param)
+        or is_response_code_interpreter_tool_call(param)
         or is_response_reasoning_item(param)
         or is_response_mcp_list_tools(param)
         or is_response_mcp_call(param)
@@ -1210,6 +1280,12 @@ def is_response_custom_tool_call(
     return param["type"] == "custom_tool_call"
 
 
+def is_response_code_interpreter_tool_call(
+    param: ResponseInputItemParam,
+) -> TypeGuard[ResponseCodeInterpreterToolCallParam]:
+    return param["type"] == "code_interpreter_call"
+
+
 def is_function_tool_param(tool_param: ToolParam) -> TypeGuard[FunctionToolParam]:
     return tool_param.get("type") == "function"
 
@@ -1228,3 +1304,7 @@ def is_computer_tool_param(tool_param: ToolParam) -> TypeGuard[ComputerToolParam
 
 def is_custom_tool_param(tool_param: ToolParam) -> TypeGuard[CustomToolParam]:
     return tool_param.get("type") == "custom"
+
+
+def is_code_interpreter_tool_param(tool_param: ToolParam) -> TypeGuard[CodeInterpreter]:
+    return tool_param.get("type") == "code_interpreter"
